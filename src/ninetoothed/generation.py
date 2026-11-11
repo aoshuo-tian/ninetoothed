@@ -7,6 +7,7 @@ import inspect
 import itertools
 import math
 import pathlib
+import os
 import subprocess
 import textwrap
 
@@ -21,8 +22,8 @@ from ninetoothed.symbol import Symbol
 from ninetoothed.tensor import Tensor
 from ninetoothed.torchifier import Torchifier
 
-CACHE_DIR = pathlib.Path.home() / ".ninetoothed"
-CACHE_DIR.mkdir(exist_ok=True)
+CACHE_DIR = pathlib.Path(os.environ.get("NINETOOTHED_CACHE_DIR", pathlib.Path.home() / ".ninetoothed")).expanduser()
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class CodeGenerator(ast.NodeTransformer):

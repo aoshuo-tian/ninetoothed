@@ -1,0 +1,35 @@
+{
+  "upstream_repository": "https://github.com/InfiniTensor/ninetoothed",
+  "upstream_tag": "v0.25.0",
+  "upstream_commit": "897f97be6a47618c7a251a87435f44880905bec5",
+  "source": "Preserved H3 head56 integration compiler snapshot dated 2026-10-23",
+  "source_archive_sha256": "0261e5919c900ecefcc7b3df0bd9bbccff81c5e0d6e5f67ea1956df81563f47d",
+  "meaningfully_modified_files": [
+    "src/ninetoothed/aot.py",
+    "src/ninetoothed/build.py",
+    "src/ninetoothed/generation.py"
+  ],
+  "files": {
+    "pyproject.toml": "669448aaa8145d9ab1793a33e7714ba98fcdfe966f0e9e81b70a5c0b32cc6462",
+    "requirements.txt": "3aba9be5669f2cf51ddc4c4a4ec9f2aee8f4667ffb58ccadb152eaf6df7cda9f",
+    "src/ninetoothed/__init__.py": "3c1de7cf4efee36a76043a2a0087111fadde36a14cdb5fc2d2db6eb0c8c50671",
+    "src/ninetoothed/aot.py": "a7bf7fbd25a4ec95a66efb2a83fc1f88b10c0aa43b3cb5028355bf4a8f554e90",
+    "src/ninetoothed/auto_tuner.py": "5dc6ba46f5b2225c4f30cc2cf02956d7cf3af4d3d8c0e8a1dfa6c513e0602bf3",
+    "src/ninetoothed/build.py": "0c44bc7e810d765373fa6a445cc7ab9cf4c9ac105857d9db72a24a130bc57448",
+    "src/ninetoothed/cudaifier.py": "223aade73e7cf5e2c1be53b597f6c10bc5a73ad2ba5c8dc316d45c6bc1d215d3",
+    "src/ninetoothed/debugging.py": "c943f7b477f0a6079001fc26ff2f345bcd87196fa362c48224e484c57859f93d",
+    "src/ninetoothed/dtype.py": "727c8d92bedaf0f0c112456c170d47144e135cc864c1d9bdde6b31b4b0c519ec",
+    "src/ninetoothed/eval.py": "8b04411f86580fb4ca9ff76be9b31dd990c40f655892ad6c04241340cc01bd69",
+    "src/ninetoothed/generation.py": "3ba422d38310aa38f89bbed748f76b0c4e3a8ef5fd0562e3c93ec56fd0dd96ab",
+    "src/ninetoothed/jit.py": "13c979edf5ba35329fcda4608a370fdbd39ee2cd6fcdec502e86818cecbc3caa",
+    "src/ninetoothed/language.py": "111880e1da708a8c36013db115e156620d4aaa59c1a3ac713c6a7c559acfd0b9",
+    "src/ninetoothed/make.py": "910bcd7effcee3a40a4fe4dbfd206a7b0e273bc84da63a61d16fef9576f6f015",
+    "src/ninetoothed/naming.py": "165d31e1e0d14ad4e99178c983ad7bf44ac49d8edb479422d004fa457f42ddf5",
+    "src/ninetoothed/symbol.py": "9e19094312cfbcc4b863c1d013248e76f1fde7f53a7fec3029eab26e4e95fdee",
+    "src/ninetoothed/tensor.py": "eed5ff59241e3d2ad58adb3123a823892790807405d4bcdb29e171c192942583",
+    "src/ninetoothed/torchifier.py": "e1c37afa36c9590b1cbaeaa69023987b4184b25f051c3ceb493beba027f2d9cd",
+    "src/ninetoothed/utils.py": "9ad4570010553e79607769f544487da01decff96d4b0a85dde2c2ede82790d24",
+    "src/ninetoothed/visualization.py": "264e6580de0effdc8d33cd5fc43d6e5229102e70c50868640f92a9ad146176c8"
+  },
+  "scope": "Compiler-source publication; not a new kernel build or a new video-quality result"
+}

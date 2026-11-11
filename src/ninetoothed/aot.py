@@ -1,10 +1,11 @@
 import ast
 import ctypes
-import itertools
 import pathlib
+import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 import uuid
@@ -79,14 +80,23 @@ def _aot(func, caller, kernel_name, num_warps, num_stages):
     grid = f"{ast.unparse(grid_extractor.grid[0])}, 1, 1"
 
     launch_arg_names = tuple(arg.arg for arg in launch_func.args.args)
-    variant_specs = _enumerate_stride_specs(
+    variant_specs = _enumerate_variant_specs(
+        launch_arg_names, tensors, _find_tensor_by_source_name
+    )
+    _, tensor_ndims, _ = _per_tensor_dim_options(
         launch_arg_names, tensors, _find_tensor_by_source_name
     )
 
     output_contents = {}
 
-    for variant_suffix, stride_spec in variant_specs:
-        variant_outputs = _build_stride_variant(
+    for (
+        variant_suffix,
+        divisibility_spec,
+        contiguity_spec,
+        size_type,
+        stride_type,
+    ) in variant_specs:
+        variant_outputs = _build_variant(
             source_file,
             kernel_func,
             launch_func,
@@ -98,12 +108,15 @@ def _aot(func, caller, kernel_name, num_warps, num_stages):
             grid=grid,
             num_warps=num_warps,
             num_stages=num_stages,
-            stride_spec=stride_spec,
+            divisibility_spec=divisibility_spec,
+            contiguity_spec=contiguity_spec,
+            size_type=size_type,
+            stride_type=stride_type,
         )
         output_contents.update(variant_outputs)
 
-    dispatcher_source, dispatcher_header = _generate_stride_dispatcher(
-        kernel_name, launch_arg_names, variant_specs
+    dispatcher_source, dispatcher_header = _generate_dispatcher(
+        kernel_name, launch_arg_names, variant_specs, tensor_ndims
     )
 
     output_contents[f"{kernel_name}.cpp"] = dispatcher_source
@@ -112,7 +125,7 @@ def _aot(func, caller, kernel_name, num_warps, num_stages):
     return output_contents
 
 
-def _generate_stride_dispatcher(kernel_name, launch_arg_names, variant_specs):
+def _generate_dispatcher(kernel_name, launch_arg_names, variant_specs, tensor_ndims):
     tensor_params = ", ".join(f"NineToothedTensor {name}" for name in launch_arg_names)
     signature_params = (
         f"NineToothedStream stream, {tensor_params}"
@@ -138,7 +151,15 @@ def _generate_stride_dispatcher(kernel_name, launch_arg_names, variant_specs):
     externs = []
     branches = []
 
-    for variant_suffix, stride_spec in variant_specs:
+    fallback_call = None
+
+    for (
+        variant_suffix,
+        divisibility_spec,
+        contiguity_spec,
+        size_type,
+        stride_type,
+    ) in variant_specs:
         variant_name = f"launch_{kernel_name}_{variant_suffix}"
         externs.append(
             f'extern "C" NineToothedResult {variant_name}({signature_params});'
@@ -146,26 +167,55 @@ def _generate_stride_dispatcher(kernel_name, launch_arg_names, variant_specs):
 
         call = f"return {variant_name}({call_args});"
 
-        if stride_spec:
-            check = " && ".join(
-                f"{name}.strides[{dim}] == 1" for name, dim in stride_spec
-            )
-            branches.append(f"{_INDENTATION}if ({check}) {call}")
+        if (size_type, stride_type) == (
+            ninetoothed.dtype.int64,
+            ninetoothed.dtype.int64,
+        ):
+            fallback_call = call
+
+            continue
+
+        checks = tuple(
+            f"{name}.shape[{dim}] % 16 == 0" for name, dim in divisibility_spec
+        ) + tuple(f"{name}.strides[{dim}] == 1" for name, dim in contiguity_spec)
+
+        if checks:
+            branches.append(f"{_INDENTATION}if ({' && '.join(checks)}) {call}")
         else:
             branches.append(f"{_INDENTATION}{call}")
+
+    prelude_lines = []
+
+    if fallback_call is not None and launch_arg_names:
+        overflow_terms = _overflow_terms(launch_arg_names, tensor_ndims)
+
+        if overflow_terms:
+            prelude_lines.append(
+                f"{_INDENTATION}if ({' || '.join(overflow_terms)}) {fallback_call}"
+            )
+
+    if fallback_call is None and launch_arg_names:
+        overflow_terms = _overflow_terms(launch_arg_names, tensor_ndims)
+        if overflow_terms:
+            prelude_lines.append(f"{_INDENTATION}if ({' || '.join(overflow_terms)}) return (NineToothedResult)1;")
+    body_lines = prelude_lines + branches
+    if fallback_call is None and branches:
+        body_lines.append(f"{_INDENTATION}return (NineToothedResult)1;")
+    if not branches and fallback_call is not None:
+        body_lines.append(f"{_INDENTATION}{fallback_call}")
 
     source = (
         f'#include "{_HEADER_PATH}"\n\n'
         + "\n".join(externs)
         + f'\n\nextern "C" {signature} {{\n'
-        + "\n".join(branches)
+        + "\n".join(body_lines)
         + "\n}\n"
     )
 
     return source, header
 
 
-def _build_stride_variant(
+def _build_variant(
     source_file,
     kernel_func,
     launch_func,
@@ -178,9 +228,17 @@ def _build_stride_variant(
     grid,
     num_warps,
     num_stages,
-    stride_spec,
+    divisibility_spec,
+    contiguity_spec,
+    size_type=ninetoothed.dtype.int32,
+    stride_type=ninetoothed.dtype.int32,
 ):
-    spec_set = {(naming.remove_prefixes(name), dim) for name, dim in stride_spec}
+    divisibility_set = {
+        (naming.remove_prefixes(name), dim) for name, dim in divisibility_spec
+    }
+    contiguity_set = {
+        (naming.remove_prefixes(name), dim) for name, dim in contiguity_spec
+    }
 
     param_strings = ["stream"]
     param_types = []
@@ -198,19 +256,30 @@ def _build_stride_variant(
             dtype = tensor.source.dtype
 
             param_types.append(f"*{dtype}:16")
-        elif Tensor.size_pattern().fullmatch(param):
-            param_types.append(ninetoothed.dtype.int64)
+        elif match := Tensor.size_pattern().fullmatch(param):
+            source_name = match.group(1)
+            dim_index = int(match.group(3))
+            bare_source_name = naming.remove_prefixes(source_name)
+
+            if (bare_source_name, dim_index) in divisibility_set:
+                param_types.append(f"{size_type}:16")
+            else:
+                param_types.append(size_type)
         elif match := Tensor.stride_pattern().fullmatch(param):
             source_name = match.group(1)
             dim_index = int(match.group(3))
             bare_source_name = naming.remove_prefixes(source_name)
 
-            if (bare_source_name, dim_index) in spec_set:
+            if (bare_source_name, dim_index) in contiguity_set:
                 param_types.append("1")
                 constexpr_param_indices.append(len(param_types) - 1)
                 constexpr_strides.append((source_name, dim_index))
             else:
-                param_types.append(f"{ninetoothed.dtype.int64}:16")
+                if (os.environ.get("NINETOOTHED_AOT_VARIANTS") == "qkrope_i32"
+                    and find_tensor(tensors, source_name).source.ndim != 3):
+                    param_types.append(stride_type)
+                else:
+                    param_types.append(f"{stride_type}:16")
         else:
             source_name = param
             tensor = find_tensor(tensors, source_name)
@@ -220,6 +289,9 @@ def _build_stride_variant(
                 param_types.append(f"{tensor.value}")
                 constexpr_param_indices.append(len(param_types) - 1)
             else:
+                if dtype == ninetoothed.dtype.float32:
+                    dtype = ninetoothed.dtype.float64
+
                 param_types.append(dtype)
 
     signature = ", ".join(param_types)
@@ -232,7 +304,18 @@ def _build_stride_variant(
         source_file, kernel_name, signature, grid, num_warps, num_stages
     )
 
-    c_source_file_name = f"{kernel_name}.{signature_hash}.c"
+    source_candidates = [
+        f"{kernel_name}.{signature_hash}{suffix}"
+        for suffix in (".c", ".cpp")
+        if f"{kernel_name}.{signature_hash}{suffix}" in output_contents
+    ]
+    if len(source_candidates) != 1:
+        raise RuntimeError(
+            "Expected exactly one Triton AOT source file; "
+            f"found {source_candidates}. "
+            f"Available files: {sorted(output_contents)}"
+        )
+    c_source_file_name = source_candidates[0]
     c_source_file = output_contents[c_source_file_name]
 
     c_header_file_name = f"{kernel_name}.{signature_hash}.h"
@@ -247,8 +330,31 @@ def _build_stride_variant(
 
     launch_func_unparsed = unparser.unparse(launch_func)
     launch_func_unparsed_lines = launch_func_unparsed.splitlines()
-    launch_func_unparsed_lines.insert(1, f"{_INDENTATION}cuCtxGetId(NULL, &ctx_id);\n")
-    launch_func_unparsed_lines.insert(1, f"{_INDENTATION}unsigned long long ctx_id;")
+    is_hip = "#include <hip/hip_runtime.h>" in c_source_file
+    if is_hip:
+        c_source_file = _prepare_hip_aot_source(c_source_file)
+    # Preserve explicit-context handling for CUDA-compatible drivers.
+    context_lines = [
+        f"{_INDENTATION}CUcontext nt_context = nullptr;",
+        f"{_INDENTATION}CUresult nt_status = cuCtxGetCurrent(&nt_context);",
+        f"{_INDENTATION}if (nt_status != CUDA_SUCCESS) return nt_status;",
+        f"{_INDENTATION}if (nt_context == nullptr) return CUDA_ERROR_INVALID_CONTEXT;",
+        f"{_INDENTATION}unsigned long long ctx_id;",
+        f"{_INDENTATION}nt_status = cuCtxGetId(nt_context, &ctx_id);",
+        f"{_INDENTATION}if (nt_status != CUDA_SUCCESS) return nt_status;",
+    ]
+    if is_hip:
+        context_lines = [
+            f"{_INDENTATION}int nt_device = 0;",
+            f"{_INDENTATION}hipError_t nt_status = hipGetDevice(&nt_device);",
+            f"{_INDENTATION}if (nt_status != hipSuccess) return nt_status;",
+            f"{_INDENTATION}hipCtx_t nt_context = nullptr;",
+            f"{_INDENTATION}nt_status = hipCtxGetCurrent(&nt_context);",
+            f"{_INDENTATION}if (nt_status != hipSuccess) return nt_status;",
+            f"{_INDENTATION}auto ctx_id = std::make_pair("
+            "nt_device, reinterpret_cast<std::uintptr_t>(nt_context));",
+        ]
+    launch_func_unparsed_lines[1:1] = context_lines
     launch_func_unparsed = "\n".join(launch_func_unparsed_lines)
     launch_func_unparsed = launch_func_unparsed.replace(
         func.__name__, f"kernels_{variant_suffix}[ctx_id].{kernel_name_with_hash}"
@@ -263,6 +369,41 @@ def _build_stride_variant(
     output_contents.pop(c_header_file_name, None)
 
     kernel_start = c_source_file.find("//")
+    cache_declaration = (
+        f"static ninetoothed::ThreadSafeUnorderedMap<unsigned long long, "
+        f"{kernel_name_with_hash}::Kernel> kernels_{variant_suffix};"
+    )
+    if is_hip:
+        # Keep includes and error helpers outside the Kernel structure.
+        marker = "// globals"
+        if c_source_file.count(marker) != 1:
+            raise RuntimeError("Unexpected Triton HIP template: globals marker")
+        kernel_start = c_source_file.index(marker)
+        if "#include" in c_source_file[kernel_start:]:
+            raise RuntimeError("Unexpected HIP include inside kernel body")
+
+        from triton.runtime import driver
+
+        target = driver.active.get_current_target()
+        if target.backend != "hip":
+            raise RuntimeError("HIP template does not match active backend")
+
+        # Use the device target's wave size, not a host-side warpSize symbol.
+        c_source_file, replacements = re.subn(
+            '\\bwarpSize\\b', str(int(target.warp_size)), c_source_file
+        )
+        if replacements != 1:
+            raise RuntimeError("Unexpected Triton HIP warpSize expression")
+
+        extra_headers = '#include <map>\n#include <utility>\n#include <cstdint>\n'
+        c_source_file = extra_headers + c_source_file
+        kernel_start += len(extra_headers)
+        cache_declaration = (
+            "static thread_local std::map<std::pair<int, std::uintptr_t>, "
+            f"{kernel_name_with_hash}::Kernel> kernels_{variant_suffix};"
+        )
+    if kernel_start < 0:
+        raise RuntimeError("Cannot locate Triton AOT kernel body")
     kernel_end = len(c_source_file)
     cpp_source_file = (
         c_source_file[:kernel_start]
@@ -272,7 +413,7 @@ def _build_stride_variant(
         + "};\n"
         + textwrap.indent(c_source_file[kernel_end:], _INDENTATION)
         + "}\n"
-        + f"\nstatic ninetoothed::ThreadSafeUnorderedMap<unsigned long long, {kernel_name_with_hash}::Kernel> kernels_{variant_suffix};\n"
+        + f"\n{cache_declaration}\n"
         + f'\nextern "C" {launch_func_unparsed}\n'
     )
     cpp_source_file_name = f"{kernel_name}.{variant_suffix}.cpp"
@@ -282,50 +423,212 @@ def _build_stride_variant(
     return output_contents
 
 
-def _enumerate_stride_specs(launch_arg_names, tensors, find_tensor):
+def _enumerate_variant_specs(launch_arg_names, tensors, find_tensor):
+    if os.environ.get("NINETOOTHED_AOT_VARIANTS") == "embedding_rows_i32":
+        _, ndims, _ = _per_tensor_dim_options(launch_arg_names, tensors, find_tensor)
+        if tuple(ndims) != (2, 1, 2):
+            raise ValueError("embedding_rows_i32 requires output/index/weight ranks2/1/2")
+        # Row count is intentionally dynamic. Only the feature sizes are :16.
+        division = tuple((name, 1) for name, ndim in zip(launch_arg_names, ndims) if ndim == 2)
+        contiguous = tuple((name, ndim - 1) for name, ndim in zip(launch_arg_names, ndims))
+        suffix = _variant_suffix(division, contiguous, launch_arg_names, ndims,
+                                 ninetoothed.dtype.int32, ninetoothed.dtype.int32)
+        return [(suffix, division, contiguous, ninetoothed.dtype.int32, ninetoothed.dtype.int32)]
+    if os.environ.get("NINETOOTHED_AOT_VARIANTS") == "qkrope_i32":
+        _, ndims, _ = _per_tensor_dim_options(launch_arg_names, tensors, find_tensor)
+        division = tuple((name, 2) for name, ndim in zip(launch_arg_names, ndims) if ndim == 3)
+        contiguous = tuple((name, 2) for name, ndim in zip(launch_arg_names, ndims) if ndim == 3)
+        contiguous += ((launch_arg_names[6], 1),)  # Actual cache inner stride, no position-stride assumptions.
+        suffix = _variant_suffix(division, contiguous, launch_arg_names, ndims,
+                                 ninetoothed.dtype.int32, ninetoothed.dtype.int32)
+        return [(suffix, division, contiguous, ninetoothed.dtype.int32, ninetoothed.dtype.int32)]
+    per_tensor_dims, tensor_ndims, innermost_dims = _per_tensor_dim_options(
+        launch_arg_names, tensors, find_tensor
+    )
+
+    def _spec_from_combo(combo):
+        return tuple(
+            (name, dim) for name, dim in zip(launch_arg_names, combo) if dim is not None
+        )
+
+    base_combo = tuple(dims[0] for dims in per_tensor_dims)
+    combos = [base_combo] if any(dim is not None for dim in base_combo) else []
+
+    for i, dims in enumerate(per_tensor_dims):
+        if len(dims) <= 1:
+            continue
+
+        for alternative_dim in dims[1:]:
+            if alternative_dim is None:
+                continue
+
+            combo = list(base_combo)
+            combo[i] = alternative_dim
+            combos.append(tuple(combo))
+
+    dim_specs = tuple(_spec_from_combo(combo) for combo in combos) + ((),)
+
+    specs = []
+
+    for divisibility_spec in dim_specs:
+        for contiguity_spec in dim_specs:
+            suffix = _variant_suffix(
+                divisibility_spec,
+                contiguity_spec,
+                launch_arg_names,
+                tensor_ndims,
+                size_type=ninetoothed.dtype.int32,
+                stride_type=ninetoothed.dtype.int32,
+            )
+            specs.append(
+                (
+                    suffix,
+                    divisibility_spec,
+                    contiguity_spec,
+                    ninetoothed.dtype.int32,
+                    ninetoothed.dtype.int32,
+                )
+            )
+
+    def _num_innermost(spec):
+        return sum(1 for name, dim in spec if innermost_dims.get(name) == dim)
+
+    def _specificity(entry):
+        _, divisibility_spec, contiguity_spec, _, _ = entry
+
+        return (
+            -len(divisibility_spec),
+            -_num_innermost(divisibility_spec),
+            -len(contiguity_spec),
+            -_num_innermost(contiguity_spec),
+        )
+
+    specs.sort(key=_specificity)
+
+    fallback_suffix = _variant_suffix(
+        (),
+        (),
+        launch_arg_names,
+        tensor_ndims,
+        size_type=ninetoothed.dtype.int64,
+        stride_type=ninetoothed.dtype.int64,
+    )
+    specs.append(
+        (
+            fallback_suffix,
+            (),
+            (),
+            ninetoothed.dtype.int64,
+            ninetoothed.dtype.int64,
+        )
+    )
+
+    # Generic int64 addressing is useful for bounded offline bring-up builds.
+    # The default retains every original specialization and its dispatch order.
+    policy = os.environ.get("NINETOOTHED_AOT_VARIANTS", "all")
+    if policy == "generic":
+        return specs[-1:]
+    if policy in ("inner32", "inner16"):
+        # Strict entry points only: caller proves unit inner strides and int32
+        # metadata/offset bounds. No generic fallback is emitted for this policy.
+        inner_spec = tuple((name, dim) for name, dim in innermost_dims.items())
+        selected = [entry for entry in specs
+                    if entry[1] == (inner_spec if policy == "inner16" else ()) and entry[2] == inner_spec
+                    and entry[3] == ninetoothed.dtype.int32]
+        if len(selected) != 1:
+            raise RuntimeError("Cannot select the strict inner32 AOT variant")
+        return selected
+    if policy != "all":
+        raise ValueError("NINETOOTHED_AOT_VARIANTS must be all, generic, inner32 or inner16")
+    return specs
+
+
+def _per_tensor_dim_options(launch_arg_names, tensors, find_tensor):
     per_tensor_dims = []
+    tensor_ndims = []
 
     for name in launch_arg_names:
         tensor = find_tensor(tensors, name)
+        ndim = tensor.source.ndim if tensor is not None else 0
+        tensor_ndims.append(ndim)
 
-        if tensor is None or tensor.source.ndim == 0:
+        if ndim == 0:
             per_tensor_dims.append((None,))
-        elif tensor.source.ndim == 1:
+        elif ndim == 1:
             per_tensor_dims.append((0,))
         else:
-            ndim = tensor.source.ndim
             per_tensor_dims.append((ndim - 1, ndim - 2))
 
-    innermost = {
+    per_tensor_dims = tuple(per_tensor_dims)
+    tensor_ndims = tuple(tensor_ndims)
+
+    innermost_dims = {
         name: dims[0]
         for name, dims in zip(launch_arg_names, per_tensor_dims)
         if dims[0] is not None
     }
 
-    specs = []
+    return per_tensor_dims, tensor_ndims, innermost_dims
 
-    for combo in itertools.product(*per_tensor_dims):
-        spec = tuple(
-            (name, dim) for name, dim in zip(launch_arg_names, combo) if dim is not None
+
+def _overflow_terms(launch_arg_names, tensor_ndims):
+    int32_min = -(2**31)
+    int32_max = 2**31 - 1
+
+    return tuple(
+        term
+        for name, ndim in zip(launch_arg_names, tensor_ndims)
+        for dim in range(ndim)
+        for term in (
+            f"{name}.shape[{dim}] > {int32_max}ULL",
+            f"{name}.strides[{dim}] > {int32_max}LL",
+            f"{name}.strides[{dim}] < {int32_min}LL",
         )
+    )
 
-        if not spec:
-            continue
 
-        suffix = "s_" + "_".join(str(dim) if dim is not None else "n" for dim in combo)
-        specs.append((suffix, spec))
+def _variant_suffix(
+    divisibility_spec,
+    contiguity_spec,
+    launch_arg_names,
+    tensor_ndims,
+    size_type=ninetoothed.dtype.int32,
+    stride_type=ninetoothed.dtype.int32,
+):
+    divisibility_part = _divisibility_suffix(
+        divisibility_spec, launch_arg_names, tensor_ndims
+    )
+    contiguity_part = _contiguity_suffix(
+        contiguity_spec, launch_arg_names, tensor_ndims
+    )
 
-    specs.append(("generic", ()))
+    return (
+        f"{divisibility_part}_{contiguity_part}_size_{size_type}_stride_{stride_type}"
+    )
 
-    def _specificity(entry):
-        _, spec = entry
-        num_innermost = sum(1 for name, dim in spec if innermost.get(name) == dim)
 
-        return (-len(spec), -num_innermost)
+def _divisibility_suffix(divisibility_spec, launch_arg_names, tensor_ndims):
+    hinted = set(divisibility_spec)
 
-    specs.sort(key=_specificity)
+    parts = tuple(
+        "16" if (name, dim) in hinted else "1"
+        for name, ndim in zip(launch_arg_names, tensor_ndims)
+        for dim in range(ndim)
+    )
 
-    return specs
+    return "divisibility_" + "_".join(parts) if parts else "divisibility"
+
+
+def _contiguity_suffix(contiguity_spec, launch_arg_names, tensor_ndims):
+    contiguous = set(contiguity_spec)
+
+    parts = tuple(
+        "1" if (name, dim) in contiguous else "0"
+        for name, ndim in zip(launch_arg_names, tensor_ndims)
+        for dim in range(ndim)
+    )
+
+    return "contiguity_" + "_".join(parts) if parts else "contiguity"
 
 
 _INDENTATION = "    "
@@ -573,7 +876,7 @@ def _compile(path, name, signature, grid, num_warps, num_stages):
         output_path = output_dir / output_name
 
         command = [
-            "python",
+            sys.executable,
             "-m",
             "triton.tools.compile",
             str(path),
@@ -621,10 +924,30 @@ def _load_launch_func(kernel_name, output_dir):
     launch_func_name = f"launch_{kernel_name}"
     launch_func = getattr(library, launch_func_name)
 
+    def _num_tensor_args(kernel_name, output_dir):
+        header_path = pathlib.Path(output_dir) / f"{kernel_name}.h"
+        text = header_path.read_text()
+        pattern = (
+            rf"NineToothedResult\s+launch_{re.escape(kernel_name)}\s*\((.*?)\)\s*;"
+        )
+        match = re.search(pattern, text)
+
+        if match is None:
+            raise RuntimeError(
+                f"Could not find launch signature for `{kernel_name}` in `{header_path}`."
+            )
+
+        params = (param.strip() for param in match.group(1).split(","))
+
+        return sum(1 for param in params if param.startswith("NineToothedTensor "))
+
+    num_tensor_args = _num_tensor_args(kernel_name, output_dir)
+
     dtype_to_index = _DTYPE_TO_INDEX
     from_torch_tensor = _ArgumentTensor.from_torch_tensor
     from_scalar = _ArgumentTensor.from_scalar
     c_double = ctypes.c_double
+    c_int64 = ctypes.c_int64
     c_void_p = ctypes.c_void_p
     current_device = torch.cuda.current_device
     get_current_raw_stream = torch._C._cuda_getCurrentRawStream
@@ -634,12 +957,17 @@ def _load_launch_func(kernel_name, output_dir):
         arguments = [None] * len(args)
 
         for i, arg in enumerate(args):
-            if isinstance(arg, Tensor_cls):
-                arguments[i] = from_torch_tensor(arg)
+            if i < num_tensor_args:
+                if isinstance(arg, Tensor_cls):
+                    arguments[i] = from_torch_tensor(arg)
+                elif type(arg) is float:
+                    arguments[i] = from_scalar(arg, c_double)
+                elif type(arg) is int:
+                    arguments[i] = from_scalar(arg, c_int64)
+                else:
+                    arguments[i] = arg
             elif type(arg) is str:
                 arguments[i] = dtype_to_index[arg]
-            elif type(arg) is float:
-                arguments[i] = from_scalar(arg, c_double)
             else:
                 arguments[i] = arg
 
@@ -652,7 +980,70 @@ def _load_launch_func(kernel_name, output_dir):
     return _run_launch_func
 
 
+
+def _prepare_hip_aot_source(source):
+    old = "    const char *str;\n    hipDrvGetErrorString(code, &str);"
+    new = (
+        "    const char *str = nullptr;\n"
+        "    hipError_t error_status = hipDrvGetErrorString(code, &str);\n"
+        "    if (error_status != hipSuccess || str == nullptr) {\n"
+        '        str = "HIP error text unavailable";\n'
+        "    }"
+    )
+    if source.count(old) != 1:
+        raise RuntimeError("Unexpected HIP error-string helper")
+    source = source.replace(old, new, 1)
+
+    pattern = (
+        r"(\bvoid (?:load|unload)_[A-Za-z0-9_]+\([^)]*\)\s*\{)"
+        r"([^{}]*)(\})"
+    )
+
+    def add_return(match):
+        return match[1] + match[2] + "    return;\n" + match[3]
+
+    source, count = re.subn(pattern, add_return, source)
+    if count != 2:
+        raise RuntimeError("Unexpected HIP load/unload function structure")
+    return source
+
+
 def _compile_library(kernel_name, output_dir):
+    source_files = sorted(output_dir.glob(f"{kernel_name}*.cpp"))
+    if not source_files:
+        raise RuntimeError("No NineToothed AOT source files to compile")
+
+    is_hip = any(
+        "#include <hip/hip_runtime.h>" in path.read_text()
+        for path in source_files
+    )
+    if is_hip:
+        candidates = (
+            "/opt/dtk/hip/bin/hipcc",
+            "/opt/dtk/bin/hipcc",
+            "hipcc",
+        )
+        compiler = next(
+            (resolved for candidate in candidates
+             if (resolved := shutil.which(candidate))),
+            None,
+        )
+        if compiler is None:
+            raise RuntimeError("HIP AOT requires hipcc; compiler not found")
+        command = [
+            compiler,
+            "--offload-host-only",
+            "-std=c++17",
+            "-shared",
+            "-fPIC",
+            "-Wl,-z,defs",
+            "-o",
+            str(output_dir / f"{kernel_name}.so"),
+        ] + [str(path) for path in source_files]
+        print("NineToothed HIP host compile:", command, flush=True)
+        subprocess.run(command, check=True)
+        return
+
     command = [
         "nvcc",
         "-shared",
